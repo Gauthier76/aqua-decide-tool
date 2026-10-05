@@ -5,7 +5,7 @@ import RoadmapReport from './views/RoadmapReport';
 import './App.css';
 
 function App() {
-  const [activeTab, setActiveTab] = useState('simulation');
+  const [activeTab, setActiveTab] = useState('baseline');
 
   return (
     <div className="App">
