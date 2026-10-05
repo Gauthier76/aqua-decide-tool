@@ -1,0 +1,1445 @@
+# ==================================================
+# ARBORESCENCE DU PROJET aqua-decide-tool
+# ==================================================
+
+aqua-decide-tool/
+├── app.py
+├── backend
+│   ├── api
+│   │   ├── routes_export.py
+│   │   ├── routes_input.py
+│   │   └── routes_simulation.py
+│   ├── core
+│   │   └── placeholder.txt
+│   ├── engine
+│   │   ├── baseline_calc.py
+│   │   ├── finance_calculator.py
+│   │   ├── lca_calculator.py
+│   │   ├── matrix_interpolator.py
+│   │   └── physics_models
+│   │       ├── evaporation_model.py
+│   │       └── ventilation_model.py
+│   └── main.py
+├── code_base.py
+├── data
+│   ├── lca_databases
+│   │   ├── energy_mix_ch.json
+│   │   └── materials_impact.json
+│   ├── mopec_rules
+│   │   └── placeholder.txt
+│   └── sim_matrices
+│       ├── colovray_plein_air.csv
+│       └── yverdon_couverte.csv
+├── frontend
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── public
+│   │   └── index.html
+│   └── src
+│       ├── App.css
+│       ├── App.js
+│       ├── components
+│       │   ├── charts
+│       │   │   └── SankeyDiagram.jsx
+│       │   ├── forms
+│       │   │   └── BaselineForm.jsx
+│       │   └── variant_toggles
+│       │       └── placeholder.txt
+│       ├── index.js
+│       ├── services
+│       │   └── api.js
+│       ├── utils
+│       └── views
+│           ├── DashboardBaseline.jsx
+│           ├── RoadmapReport.jsx
+│           └── SimulationEngine.jsx
+├── geneve.csv
+├── lancer_aquadecide.bat
+├── package.json
+├── README.md
+├── requirements.txt
+├── scripts_processing
+│   ├── parse_idaice_outputs.py
+│   └── validate_matrices.py
+└── tests
+    ├── test_engine_physics.py
+    └── test_lca_values.py
+
+# ==================================================
+
+
+# ==================================================
+# FILE: app.py
+# ==================================================
+
+
+
+# ==================================================
+# FILE: backend\api\routes_export.py
+# ==================================================
+
+# ==================================================
+# FILE: backend\api\routes_export.py
+# ==================================================
+
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
+import datetime
+
+router = APIRouter()
+
+
+@router.post("/export/roadmap")
+def export_roadmap(data: dict):
+    """
+    Génère une feuille de route exportable pour la commune.
+    Dans une version de production, ceci pourrait générer un PDF avec reportlab.
+    """
+    report = {
+        "title": "Feuille de Route - Optimisation Énergétique (MoPEC)",
+        "date_generated": datetime.datetime.now().isoformat(),
+        "baseline_ide": data.get("baseline_ide", 0),
+        "target_ide": data.get("target_ide", 0),
+        "recommended_measures": data.get("measures", []),
+        "financial_summary": {
+            "total_capex_chf": data.get("capex", 0),
+            "yearly_savings_chf": data.get("savings", 0)
+        }
+    }
+
+    return JSONResponse(content={"status": "success", "report": report})
+
+# ==================================================
+# FILE: backend\api\routes_input.py
+# ==================================================
+
+from fastapi import APIRouter
+from pydantic import BaseModel
+from engine.baseline_calc import calculate_ide, evaluate_mopec_compliance, estimate_thermal_breakdown
+
+router = APIRouter()
+
+class PoolBaselineConfig(BaseModel):
+    commune_name: str
+    typology: str
+    surface_eau_m2: float
+    volume_eau_m3: float
+    annee_construction: int
+    consommation_thermique_kwh: float
+    consommation_electrique_kwh: float
+    production_chaleur: str
+    cta_age: int = 0
+    cta_recuperation: bool = False
+    filtres_age: int = 0
+    pompes_vfd: bool = False
+
+@router.post("/baseline")
+def register_baseline(config: PoolBaselineConfig):
+    # 1. Calcul de l'IDE global
+    total_energy = config.consommation_thermique_kwh + config.consommation_electrique_kwh
+    ide = calculate_ide(total_energy, config.surface_eau_m2)
+
+    # 2. Validation centralisée MoPEC
+    mopec_status = evaluate_mopec_compliance(config.typology, config.production_chaleur)
+
+    # 3. Ventilation thermodynamique (SIA 385/9)
+    breakdown = estimate_thermal_breakdown(config.consommation_thermique_kwh, config.typology)
+
+    return {
+        "status": "success",
+        "ide_calcul_kwh_m2": round(ide, 2),
+        "ofen_target_status": "Dépassement" if ide > 240 else "Conforme",
+        "mopec_compliance": mopec_status,
+        "thermal_breakdown": breakdown
+    }
+
+# ==================================================
+# FILE: backend\api\routes_simulation.py
+# ==================================================
+
+from fastapi import APIRouter
+from pydantic import BaseModel
+from engine.physics_models.evaporation_model import calculate_evaporation_loss
+from engine.lca_calculator import calculate_carbon_roi
+from engine.finance_calculator import calculate_measure_financials
+
+router = APIRouter()
+
+
+class MultiVariantInput(BaseModel):
+    area_m2: float
+    t_water: float
+    t_air: float
+    rh_air: float
+    wind_speed: float
+    current_energy: str = "gaz"
+
+    # 1. Leviers Passifs
+    apply_cover: bool = False
+    apply_isolation: bool = False
+
+    # 2. Leviers Opérationnels
+    apply_mcr_night_setback: bool = False
+    apply_vfd_pumps: bool = False
+
+    # 3. Leviers Actifs
+    heating_system: str = "aucun"  # "pac", "cad", "solaire"
+    apply_cta_recovery: bool = False
+
+
+@router.post("/simulate")
+def run_simulation(data: MultiVariantInput):
+    # Baseline énergétique annuelle estimée (simplifiée 8760h)
+    q_loss_base_kw = calculate_evaporation_loss(data.t_water, data.t_air, data.rh_air, data.wind_speed, data.area_m2,
+                                                False)
+    baseline_energy_kwh = q_loss_base_kw * 8760
+
+    # Simulation de l'état modifié
+    t_water_sim = data.t_water
+    if data.apply_mcr_night_setback:
+        t_water_sim -= 1.0  # Abaissement de 1°C
+
+    q_loss_sim_kw = calculate_evaporation_loss(
+        t_water_sim, data.t_air, data.rh_air, data.wind_speed, data.area_m2,
+        is_covered=data.apply_cover
+    )
+
+    simulated_energy_kwh = q_loss_sim_kw * 8760
+
+    # Bonus d'économie si isolation ou récupération CTA activées
+    if data.apply_isolation:
+        simulated_energy_kwh *= 0.90  # -10% de pertes par conduction
+    if data.apply_cta_recovery:
+        simulated_energy_kwh *= 0.85  # -15% sur la charge thermique globale
+
+    energy_saved_kwh = max(0, baseline_energy_kwh - simulated_energy_kwh)
+
+    measures_evaluation = []
+
+    # Évaluation des mesures sélectionnées pour le rapport
+    if data.apply_cover:
+        finances = calculate_measure_financials("bache_thermique", data.area_m2, energy_saved_kwh * 0.6,
+                                                data.current_energy)
+        trc = calculate_carbon_roi(energy_saved_kwh * 0.6, "bache_thermique", data.area_m2)
+        measures_evaluation.append({
+            "category": "Passif",
+            "name": "Bâche Thermique Nocturne",
+            "capex_chf": finances["capex_chf"],
+            "savings_chf_year": finances["yearly_savings_chf"],
+            "tri_years": finances["tri_years"],
+            "trc_years": round(trc, 2)
+        })
+
+    if data.apply_isolation:
+        finances = calculate_measure_financials("isolation_cuve", data.area_m2, energy_saved_kwh * 0.1,
+                                                data.current_energy)
+        measures_evaluation.append({
+            "category": "Passif",
+            "name": "Isolation / Cuvelage",
+            "capex_chf": finances["capex_chf"],
+            "savings_chf_year": finances["yearly_savings_chf"],
+            "tri_years": finances["tri_years"],
+            "trc_years": 3.5
+        })
+
+    if data.apply_mcr_night_setback:
+        finances = calculate_measure_financials("optimisation_mcr", 1, energy_saved_kwh * 0.15, data.current_energy)
+        measures_evaluation.append({
+            "category": "Opérationnel",
+            "name": "Optimisation MCR & Abaissement Nocturne",
+            "capex_chf": finances["capex_chf"],
+            "savings_chf_year": finances["yearly_savings_chf"],
+            "tri_years": finances["tri_years"],
+            "trc_years": 0.0
+        })
+
+    if data.apply_vfd_pumps:
+        finances = calculate_measure_financials("variation_frequence", 1, 15000, data.current_energy)  # gain électrique
+        measures_evaluation.append({
+            "category": "Opérationnel",
+            "name": "Variateurs de Fréquence (Pompes VFD)",
+            "capex_chf": finances["capex_chf"],
+            "savings_chf_year": finances["yearly_savings_chf"],
+            "tri_years": finances["tri_years"],
+            "trc_years": 0.5
+        })
+
+    if data.heating_system == "cad":
+        finances = calculate_measure_financials("raccordement_cad", 1, energy_saved_kwh, data.current_energy)
+        measures_evaluation.append({
+            "category": "Actif",
+            "name": "Raccordement Chauffage à Distance (CAD)",
+            "capex_chf": finances["capex_chf"],
+            "savings_chf_year": finances["yearly_savings_chf"],
+            "tri_years": finances["tri_years"],
+            "trc_years": 1.2
+        })
+    elif data.heating_system == "pac":
+        finances = calculate_measure_financials("pac_geothermique", 200, energy_saved_kwh, data.current_energy)
+        measures_evaluation.append({
+            "category": "Actif",
+            "name": "Pompe à Chaleur (PAC) Géothermique",
+            "capex_chf": finances["capex_chf"],
+            "savings_chf_year": finances["yearly_savings_chf"],
+            "tri_years": finances["tri_years"],
+            "trc_years": 2.0
+        })
+
+    if data.apply_cta_recovery:
+        finances = calculate_measure_financials("recuperation_cta", 1, energy_saved_kwh * 0.2, data.current_energy)
+        measures_evaluation.append({
+            "category": "Actif",
+            "name": "Récupération de Chaleur CTA (Double Flux)",
+            "capex_chf": finances["capex_chf"],
+            "savings_chf_year": finances["yearly_savings_chf"],
+            "tri_years": finances["tri_years"],
+            "trc_years": 1.0
+        })
+
+    mopec_compliant = data.apply_cover and (data.heating_system in ["cad", "pac"] or data.current_energy == "cad")
+
+    return {
+        "status": "success",
+        "thermal_loss_kw": round(q_loss_sim_kw, 2),
+        "energy_saved_kwh": round(energy_saved_kwh, 0),
+        "mopec_compliant": mopec_compliant,
+        "measures_evaluation": measures_evaluation
+    }
+
+# ==================================================
+# FILE: backend\engine\baseline_calc.py
+# ==================================================
+
+def calculate_ide(total_energy_kwh: float, pool_area_m2: float) -> float:
+    """Calcule l'Indice de Dépense Énergétique (IDE) en kWh/m2/an."""
+    if pool_area_m2 <= 0:
+        raise ValueError("La surface du bassin doit être supérieure à 0.")
+    return total_energy_kwh / pool_area_m2
+
+
+def evaluate_mopec_compliance(typology: str, production_chaleur: str) -> dict:
+    """
+    Évalue la conformité de l'état initial par rapport au MoPEC et aux lois cantonales (ex: LVLEne).
+    """
+    compliance = {
+        "is_compliant": True,
+        "warnings": []
+    }
+
+    fossiles = ["gaz", "mazout"]
+
+    # Règle stricte pour le plein air : 100% renouvelable
+    if typology == "extérieure" and production_chaleur in fossiles:
+        compliance["is_compliant"] = False
+        compliance["warnings"].append(
+            "Non-conformité MoPEC : Les piscines extérieures ne peuvent être chauffées aux énergies fossiles."
+        )
+
+    # Règle pour l'intérieur : 50% renouvelable / récupération
+    if typology in ["intérieure", "mixte"] and production_chaleur in fossiles:
+        compliance["warnings"].append(
+            "Alerte MoPEC : Les piscines couvertes exigent 50% de couverture par les EnR ou rejets thermiques."
+        )
+
+    # Étant dans l'état initial (Baseline), on signale l'absence de bâche
+    compliance["is_compliant"] = False
+    compliance["warnings"].append(
+        "Absence de couverture thermique nocturne (exigence minimale pour limiter l'évaporation).")
+
+    return compliance
+
+
+def estimate_thermal_breakdown(conso_thermique_kwh: float, typology: str) -> dict:
+    """
+    Ventile la facture thermique annuelle selon des ratios physiques moyens
+    basés sur la norme SIA 385/9 et notre état de l'art (HEIG-VD).
+    """
+    # En l'absence de modélisation horaire pour la Baseline, nous utilisons
+    # des clefs de répartition macroscopiques reconnues pour l'audit.
+    if typology == "extérieure":
+        # Le vent et l'air libre favorisent massivement l'évaporation
+        evap = conso_thermique_kwh * 0.60
+        conv_rad = conso_thermique_kwh * 0.30
+        eau = conso_thermique_kwh * 0.10  # Chauffage de l'eau de renouvellement (hygiène)
+    else:
+        # En intérieur, la déshumidification et la CTA modifient l'équilibre
+        evap = conso_thermique_kwh * 0.50
+        conv_rad = conso_thermique_kwh * 0.15
+        eau = conso_thermique_kwh * 0.35  # Inclut l'air neuf de la CTA et l'eau
+
+    return {
+        "evaporation_kwh": evap,
+        "convection_radiation_kwh": conv_rad,
+        "renouvellement_kwh": eau
+    }
+
+# ==================================================
+# FILE: backend\engine\finance_calculator.py
+# ==================================================
+
+# Base de données des coûts d'investissement macroscopiques (CAPEX) - Estimations Suisses
+CAPEX_DB = {
+    "bache_thermique": 150.0,  # CHF / m2 de bassin (Passif)
+    "isolation_cuve": 200.0,  # CHF / m2 de bassin (Passif)
+    "optimisation_mcr": 8000.0,  # CHF forfaitaire (Opérationnel)
+    "variation_frequence": 12000.0,  # CHF forfaitaire (Opérationnel - VFD)
+    "pac_geothermique": 1800.0,  # CHF / kW thermique installé (Actif)
+    "raccordement_cad": 50000.0,  # CHF forfaitaire sous-station (Actif)
+    "solaire_thermique": 850.0,  # CHF / m2 de capteur (Actif)
+    "recuperation_cta": 25000.0  # CHF forfaitaire double flux / échangeur (Actif)
+}
+
+# Prix de l'énergie (OPEX) - CHF / kWh
+OPEX_DB = {
+    "gaz": 0.12,
+    "mazout": 0.11,
+    "electricite": 0.22,
+    "cad": 0.14
+}
+
+
+def calculate_measure_financials(measure_key: str, dimension_unit: float, energy_saved_kwh: float,
+                                 current_energy_type: str) -> dict:
+    """
+    Calcule le CAPEX et le TRI (Temps de Retour sur Investissement en années).
+    """
+    capex_chf = CAPEX_DB.get(measure_key, 0) * dimension_unit
+    if measure_key in ["optimisation_mcr", "variation_frequence", "raccordement_cad", "recuperation_cta"]:
+        capex_chf = CAPEX_DB.get(measure_key, 0)  # Forfaitaire
+
+    energy_price = OPEX_DB.get(current_energy_type, 0.12)
+    yearly_savings_chf = energy_saved_kwh * energy_price
+
+    if yearly_savings_chf <= 0:
+        tri_years = float('inf')
+    else:
+        tri_years = capex_chf / yearly_savings_chf
+
+    return {
+        "capex_chf": round(capex_chf, 2),
+        "yearly_savings_chf": round(yearly_savings_chf, 2),
+        "tri_years": round(tri_years, 1)
+    }
+
+# ==================================================
+# FILE: backend\engine\lca_calculator.py
+# ==================================================
+
+# Base de données KBOB simplifiée (kg CO2-eq / unité) - Données Suisses
+KBOB_DB = {
+    # Énergie Grise (Matériaux et Installations)
+    "bache_thermique": 2.1,  # kg CO2-eq / m2
+    "isolation_cuve": 15.5,  # kg CO2-eq / m2 (ex: XPS + étanchéité)
+    "pac_geothermique": 250.0,  # kg CO2-eq / kW (Forage + Machine)
+    "raccordement_cad": 1500.0,  # kg CO2-eq forfaitaire (Sous-station)
+    "variation_frequence": 120.0,  # kg CO2-eq (Électronique de puissance)
+    "recuperation_cta": 800.0,  # kg CO2-eq (Échangeur à plaques / rotatif)
+    "optimisation_mcr": 0.0,  # Pur logiciel (Dette carbone nulle)
+
+    # Facteurs d'émissions (Exploitation)
+    "mix_electrique_ch": 0.029,  # kg CO2-eq / kWh (Mix de consommation CH)
+    "gaz_naturel": 0.228,  # kg CO2-eq / kWh (PCI)
+    "mazout": 0.301,  # kg CO2-eq / kWh (PCI)
+    "mix_cad": 0.045  # kg CO2-eq / kWh (Moyenne réseaux CAD EnR)
+}
+
+
+def calculate_carbon_roi(energy_saved_kwh_per_year: float, measure_key: str, dimension_unit: float,
+                         current_energy: str = "gaz") -> float:
+    """
+    Calcule le Temps de Retour Carbone (TRC) en années.
+    """
+    # 1. Calcul de la dette carbone initiale (Fabrication / Installation)
+    carbon_debt = KBOB_DB.get(measure_key, 0) * dimension_unit
+
+    # 2. Gain carbone annuel (Émissions évitées)
+    # L'énergie économisée l'est sur le vecteur actuel (généralement fossile pour la baseline)
+    emission_factor = KBOB_DB.get(current_energy, KBOB_DB["gaz_naturel"])
+    carbon_saved_per_year = energy_saved_kwh_per_year * emission_factor
+
+    if carbon_saved_per_year <= 0:
+        return float('inf')
+
+    return carbon_debt / carbon_saved_per_year
+
+
+def calculate_total_emissions_avoided(energy_saved_kwh: float, current_energy: str, new_energy: str = None) -> float:
+    """
+    Calcule la réduction totale des émissions annuelles (en tonnes de CO2-eq).
+    """
+    emission_factor_old = KBOB_DB.get(current_energy, 0.228)
+
+    # Si on change de vecteur (ex: Gaz -> PAC), l'économie est double :
+    # baisse des besoins ET décarbonation du vecteur restant.
+    if new_energy and new_energy != "aucun":
+        emission_factor_new = KBOB_DB.get(new_energy, 0.029)  # PAC utilise le mix CH
+        # Simplification macroscopique pour le prototype
+        tons_avoided = (energy_saved_kwh * emission_factor_old) / 1000.0
+    else:
+        tons_avoided = (energy_saved_kwh * emission_factor_old) / 1000.0
+
+    return tons_avoided
+
+# ==================================================
+# FILE: backend\engine\matrix_interpolator.py
+# ==================================================
+
+# ==================================================
+# FILE: backend\engine\matrix_interpolator.py
+# ==================================================
+
+import pandas as pd
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+
+
+class MatrixInterpolator:
+    """
+    Classe permettant d'interpoler les résultats transitoires (Polysun / IDA-ICE)
+    pré-calculés pour éviter de relancer des simulations complètes.
+    """
+
+    def __init__(self, matrix_path: str):
+        self.matrix_path = matrix_path
+        self.data = None
+        self._load_matrix()
+
+    def _load_matrix(self):
+        # Charge la matrice pré-calculée en mémoire
+        try:
+            self.data = pd.read_csv(self.matrix_path)
+        except Exception as e:
+            print(f"Erreur lors du chargement de la matrice: {e}")
+
+    def get_interpolated_value(self, t_air, t_water, wind_speed):
+        """
+        Interpole la valeur de besoin de chaleur en fonction des inputs.
+        (Méthode simplifiée pour le prototype).
+        """
+        if self.data is None:
+            return 0.0
+
+        # Logique d'interpolation N-D (Nearest ou Linear) basée sur les colonnes de la matrice
+        # Exemple basique de recherche du plus proche voisin
+        diff = np.abs(self.data['T_air'] - t_air) + \
+               np.abs(self.data['T_water'] - t_water) + \
+               np.abs(self.data['Wind'] - wind_speed)
+
+        best_match_idx = diff.argmin()
+        return self.data.loc[best_match_idx, 'Q_total_kW']
+
+# ==================================================
+# FILE: backend\engine\physics_models\evaporation_model.py
+# ==================================================
+
+import numpy as np
+
+
+def calculate_saturation_pressure(T_water_celsius):
+    """Calcule la pression de vapeur saturante (Pa) selon la formule de Magnus."""
+    return 611.2 * np.exp(17.67 * T_water_celsius / (T_water_celsius + 243.5))
+
+
+def calculate_evaporation_loss(T_water, T_air, RH_air, wind_speed, pool_area, is_covered=False):
+    """
+    Calcule les pertes thermiques par évaporation (SIA 385/9 / ASHRAE).
+    Retourne la puissance de perte en kW.
+    """
+    # Pressions partielles
+    P_water_sat = calculate_saturation_pressure(T_water)
+    P_air = calculate_saturation_pressure(T_air) * (RH_air / 100.0)
+    Delta_P_kPa = max(0, P_water_sat - P_air) / 1000.0
+
+    # Flux massique d'évaporation (kg / m2.h)
+    m_evap = (0.089 + 0.0782 * wind_speed) * Delta_P_kPa
+
+    # Impact de la bâche (réduit l'évaporation de 95%)
+    if is_covered:
+        m_evap *= 0.05
+
+    # Chaleur latente de vaporisation (approx 0.627 kWh/kg)
+    Q_evap_kW = m_evap * pool_area * 0.627
+    return Q_evap_kW
+
+# ==================================================
+# FILE: backend\engine\physics_models\ventilation_model.py
+# ==================================================
+
+# ==================================================
+# FILE: backend\engine\physics_models\ventilation_model.py
+# ==================================================
+
+def calculate_cta_power_savings(q_airflow_initial: float, reduction_factor: float) -> float:
+    """
+    Calcule les économies électriques des ventilateurs d'une Centrale de Traitement d'Air (CTA)
+    lors de la réduction de débit (nuit/bâche), basé sur les lois d'affinité hydraulique/aéraulique.
+
+    P_2 = P_1 * (Q_2 / Q_1)^3
+    """
+    if not (0 < reduction_factor <= 1):
+        raise ValueError("Le facteur de réduction doit être entre 0 et 1.")
+
+    # La puissance évolue au cube du débit
+    power_ratio = reduction_factor ** 3
+    return 1 - power_ratio
+
+
+def calculate_latent_heat_recovery(m_evap_kg_h: float, efficiency: float = 0.75) -> float:
+    """
+    Calcule la chaleur latente récupérée par une CTA double flux ou PAC intégrée
+    conformément aux exigences de récupération du MoPEC et SIA 382/1.
+    """
+    # Chaleur latente de l'eau ~ 0.627 kWh/kg
+    total_latent_heat_kw = m_evap_kg_h * 0.627
+    recovered_kw = total_latent_heat_kw * efficiency
+    return recovered_kw
+
+# ==================================================
+# FILE: backend\main.py
+# ==================================================
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from api import routes_simulation, routes_input, routes_export
+
+app = FastAPI(title="AquaDecide API (HEIG-VD)", version="1.0")
+
+# Autoriser le frontend (React) à communiquer avec l'API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Inclusion de TOUTES les routes (Diagnostic, Variantes, Feuille de route)
+app.include_router(routes_input.router, prefix="/api/v1")
+app.include_router(routes_simulation.router, prefix="/api/v1")
+app.include_router(routes_export.router, prefix="/api/v1")
+
+@app.get("/")
+def read_root():
+    return {"message": "Bienvenue sur l'API du Moteur Thermodynamique AquaDecide"}
+
+# ==================================================
+# FILE: code_base.py
+# ==================================================
+
+from pathlib import Path
+
+
+def generate_tree(directory, prefix=""):
+    """Génère une représentation textuelle de l'arborescence du projet en excluant les dossiers techniques."""
+    tree_str = ""
+    # Exclusion explicite des dossiers techniques (ajout de node_modules et build pour le JS)
+    excluded_dirs = {".idea", ".venv", "venv", "__pycache__", ".git", "newPlot", ".vscode", "node_modules", "build"}
+
+    items = sorted([item for item in directory.iterdir() if
+                    item.name not in excluded_dirs and item.name != "tous_les_fichiers.txt"])
+
+    for index, path in enumerate(items):
+        connector = "└── " if index == len(items) - 1 else "├── "
+        tree_str += f"{prefix}{connector}{path.name}\n"
+        if path.is_dir():
+            extension = "    " if index == len(items) - 1 else "│   "
+            tree_str += generate_tree(path, prefix + extension)
+    return tree_str
+
+
+def main():
+    root_dir = Path(__file__).resolve().parent
+    output_path = root_dir / "tous_les_fichiers.txt"
+
+    # Ajout de node_modules et build pour éviter d'aspirer les dépendances JS
+    excluded_dirs_set = {".idea", ".venv", "venv", "__pycache__", ".git", "newPlot", ".vscode", "node_modules", "build"}
+
+    with output_path.open("w", encoding="utf-8") as outfile:
+        # 1. Écrire l'arborescence du projet au début du fichier
+        outfile.write("# " + "=" * 50 + "\n")
+        outfile.write("# ARBORESCENCE DU PROJET aqua-decide-tool\n")
+        outfile.write("# " + "=" * 50 + "\n\n")
+        outfile.write(f"{root_dir.name}/\n")
+        outfile.write(generate_tree(root_dir))
+        outfile.write("\n" + "# " + "=" * 50 + "\n\n")
+
+        # 2. Rechercher récursivement les fichiers par extension
+        source_files = []
+        extensions = ["*.py", "*.js", "*.jsx"]
+
+        for ext in extensions:
+            for p in root_dir.rglob(ext):
+                # Ignore si l'un des parents fait partie des dossiers exclus
+                if any(ex in p.parts for ex in excluded_dirs_set):
+                    continue
+                if p.resolve() == output_path.resolve():
+                    continue
+                source_files.append(p)
+
+        # Trier tous les fichiers trouvés par ordre alphabétique de chemin
+        source_files = sorted(source_files)
+
+        for filepath in source_files:
+            rel_path = filepath.relative_to(root_dir)
+            header = f"\n# {'=' * 50}\n# FILE: {rel_path}\n# {'=' * 50}\n\n"
+            outfile.write(header)
+            try:
+                outfile.write(filepath.read_text(encoding="utf-8"))
+            except Exception as e:
+                outfile.write(f"# Erreur de lecture du fichier : {e}\n")
+            outfile.write("\n")
+
+    print(f"✅ Architecture et codes sources (.py, .js, .jsx) exportés avec succès dans : {output_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+# ==================================================
+# FILE: frontend\src\App.js
+# ==================================================
+
+import React, { useState } from 'react';
+import DashboardBaseline from './views/DashboardBaseline';
+import SimulationEngine from './views/SimulationEngine';
+import RoadmapReport from './views/RoadmapReport';
+import './App.css';
+
+function App() {
+  const [activeTab, setActiveTab] = useState('simulation');
+
+  return (
+    <div className="App">
+      <header className="App-header" style={{ padding: '1rem', backgroundColor: '#2c3e50', color: 'white' }}>
+        <h1>🏊‍♂️ AquaDecide Tool (HEIG-VD)</h1>
+        <nav style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
+            <button onClick={() => setActiveTab('baseline')} style={{ padding: '8px 15px', cursor: 'pointer' }}>1. Diagnostic (Baseline)</button>
+            <button onClick={() => setActiveTab('simulation')} style={{ padding: '8px 15px', cursor: 'pointer' }}>2. Moteur de Variantes</button>
+            <button onClick={() => setActiveTab('roadmap')} style={{ padding: '8px 15px', cursor: 'pointer' }}>3. Feuille de Route</button>
+        </nav>
+      </header>
+
+      <main className="App-content" style={{ padding: '2rem' }}>
+        {activeTab === 'baseline' && <DashboardBaseline />}
+        {activeTab === 'simulation' && <SimulationEngine />}
+        {activeTab === 'roadmap' && <RoadmapReport />}
+      </main>
+    </div>
+  );
+}
+
+export default App;
+
+# ==================================================
+# FILE: frontend\src\components\charts\SankeyDiagram.jsx
+# ==================================================
+
+This is a placeholder file.
+
+# ==================================================
+# FILE: frontend\src\components\forms\BaselineForm.jsx
+# ==================================================
+
+import React, { useState } from 'react';
+
+const BaselineForm = ({ onSubmit, isLoading }) => {
+    // État initial basé sur une infrastructure vieillissante standard
+    const [formData, setFormData] = useState({
+        commune_name: '',
+        typology: 'extérieure',
+        surface_eau_m2: 1000,
+        volume_eau_m3: 2000,
+        annee_construction: 1975,
+        consommation_thermique_kwh: 450000,
+        consommation_electrique_kwh: 120000,
+        production_chaleur: 'gaz',
+        cta_age: 15,
+        cta_recuperation: false,
+        filtres_age: 20,
+        pompes_vfd: false
+    });
+
+    const handleChange = (e) => {
+        const { name, value, type, checked } = e.target;
+        setFormData({
+            ...formData,
+            [name]: type === 'checkbox' ? checked : (type === 'number' ? parseFloat(value) : value)
+        });
+    };
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        onSubmit(formData);
+    };
+
+    return (
+        <form onSubmit={handleSubmit} className="baseline-form">
+            <h3>1. Informations Générales & Géométrie</h3>
+            <div className="form-grid">
+                <div className="form-group">
+                    <label>Nom de la Commune</label>
+                    <input type="text" name="commune_name" value={formData.commune_name} onChange={handleChange} required />
+                </div>
+                <div className="form-group">
+                    <label>Typologie</label>
+                    <select name="typology" value={formData.typology} onChange={handleChange}>
+                        <option value="extérieure">Plein air (Extérieure)</option>
+                        <option value="intérieure">Couverte (Intérieure)</option>
+                        <option value="mixte">Mixte</option>
+                    </select>
+                </div>
+                <div className="form-group">
+                    <label>Surface en eau (m²)</label>
+                    <input type="number" name="surface_eau_m2" value={formData.surface_eau_m2} onChange={handleChange} min="10" required />
+                </div>
+                <div className="form-group">
+                    <label>Année de construction</label>
+                    <input type="number" name="annee_construction" value={formData.annee_construction} onChange={handleChange} required />
+                </div>
+            </div>
+
+            <h3>2. Systèmes Actuels (État des lieux)</h3>
+            <div className="form-grid">
+                <div className="form-group">
+                    <label>Production de Chaleur principale</label>
+                    <select name="production_chaleur" value={formData.production_chaleur} onChange={handleChange}>
+                        <option value="gaz">Gaz Naturel</option>
+                        <option value="mazout">Mazout</option>
+                        <option value="pac">Pompe à Chaleur (PAC)</option>
+                        <option value="cad">Chauffage à Distance (CAD)</option>
+                        <option value="solaire">Solaire Thermique (Appoint)</option>
+                    </select>
+                </div>
+                
+                {formData.typology !== 'extérieure' && (
+                    <>
+                        <div className="form-group">
+                            <label>Âge de la CTA (années)</label>
+                            <input type="number" name="cta_age" value={formData.cta_age} onChange={handleChange} min="0" />
+                        </div>
+                        <div className="form-group checkbox-group">
+                            <label>
+                                <input type="checkbox" name="cta_recuperation" checked={formData.cta_recuperation} onChange={handleChange} />
+                                CTA avec récupération double flux
+                            </label>
+                        </div>
+                    </>
+                )}
+
+                <div className="form-group checkbox-group">
+                    <label>
+                        <input type="checkbox" name="pompes_vfd" checked={formData.pompes_vfd} onChange={handleChange} />
+                        Variateurs de fréquence (Pompes hydrauliques)
+                    </label>
+                </div>
+            </div>
+
+            <h3>3. Données de Consommation Annuelles</h3>
+            <div className="form-grid">
+                <div className="form-group">
+                    <label>Chaleur (kWh/an)</label>
+                    <input type="number" name="consommation_thermique_kwh" value={formData.consommation_thermique_kwh} onChange={handleChange} required />
+                </div>
+                <div className="form-group">
+                    <label>Électricité (kWh/an)</label>
+                    <input type="number" name="consommation_electrique_kwh" value={formData.consommation_electrique_kwh} onChange={handleChange} required />
+                </div>
+            </div>
+
+            <div className="form-actions">
+                <button type="submit" className="btn-primary" disabled={isLoading}>
+                    {isLoading ? 'Calcul en cours...' : 'Générer le Diagnostic Initial'}
+                </button>
+            </div>
+        </form>
+    );
+};
+
+export default BaselineForm;
+
+# ==================================================
+# FILE: frontend\src\index.js
+# ==================================================
+
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+# ==================================================
+# FILE: frontend\src\services\api.js
+# ==================================================
+
+import axios from 'axios';
+
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1';
+
+export const submitBaseline = async (config) => {
+    try {
+        const response = await axios.post(`${API_URL}/baseline`, config);
+        return response.data;
+    } catch (error) {
+        throw new Error("Erreur lors de l'enregistrement de la baseline : " + error.message);
+    }
+};
+
+export const runSimulation = async (params) => {
+    try {
+        const response = await axios.post(`${API_URL}/simulate`, params);
+        return response.data;
+    } catch (error) {
+        throw new Error("Erreur lors du calcul dynamique : " + error.message);
+    }
+};
+
+# ==================================================
+# FILE: frontend\src\views\DashboardBaseline.jsx
+# ==================================================
+
+// ==================================================
+// FILE: frontend/src/views/DashboardBaseline.jsx
+// ==================================================
+
+import React, { useState } from 'react';
+import BaselineForm from '../components/forms/BaselineForm';
+import { Chart } from 'react-google-charts';
+import { submitBaseline } from '../services/api';
+
+const DashboardBaseline = () => {
+    const [result, setResult] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState(null);
+
+    const handleFormSubmit = async (formData) => {
+        setIsLoading(true);
+        setError(null); // Réinitialisation des erreurs avant un nouvel appel
+
+        try {
+            // APPEL RÉEL À L'API FASTAPI
+            // Transmission des données de l'infrastructure vers routes_input.py
+            const data = await submitBaseline(formData);
+
+            // Le backend renvoie la structure : ide_calcul_kwh_m2, ofen_target_status, mopec_compliance, thermal_breakdown
+            setResult(data);
+        } catch (err) {
+            console.error("Erreur de calcul Backend :", err);
+            setError("Impossible de joindre le moteur thermodynamique (API FastAPI). Vérifiez que le serveur Python est lancé.");
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    // Configuration dynamique du diagramme de Sankey basé sur les calculs physiques du backend
+    const generateSankeyData = () => {
+        if (!result || !result.thermal_breakdown) return [];
+
+        const { evaporation_kwh, convection_radiation_kwh, renouvellement_kwh } = result.thermal_breakdown;
+        const total_pertes = evaporation_kwh + convection_radiation_kwh + renouvellement_kwh;
+
+        return [
+            ["Source", "Déperdition", "Énergie (kWh/an)"],
+            ["Production Chaleur", "Chauffage Bassin", total_pertes],
+            ["Chauffage Bassin", "Évaporation (Latente)", Math.round(evaporation_kwh)],
+            ["Chauffage Bassin", "Convection/Radiation", Math.round(convection_radiation_kwh)],
+            ["Chauffage Bassin", "Renouvellement d'Eau Normatif", Math.round(renouvellement_kwh)]
+        ];
+    };
+
+    return (
+        <div className="dashboard-baseline">
+            <div className="module-header">
+                <h2>Module 1 : Diagnostic de l'Existant (Baseline)</h2>
+                <p>Évaluation de la performance énergétique initiale et de la conformité aux exigences MoPEC.</p>
+            </div>
+
+            <div className="layout-grid">
+                {/* PANNEAU DE SAISIE */}
+                <div className="input-section">
+                    <BaselineForm onSubmit={handleFormSubmit} isLoading={isLoading} />
+                    {error && (
+                        <div className="error-alert" style={{ color: 'red', marginTop: '1rem', padding: '1rem', border: '1px solid red', backgroundColor: '#ffe6e6' }}>
+                            <strong>⚠️ Erreur Système :</strong> {error}
+                        </div>
+                    )}
+                </div>
+
+                {/* PANNEAU DES RÉSULTATS (Généré après l'appel API) */}
+                {result && (
+                    <div className="results-section">
+                        <h3>Bilan de l'Audit Initial</h3>
+
+                        {/* Indicateurs de performance (KPI) */}
+                        <div className="kpi-grid">
+                            <div className="kpi-card">
+                                <h4>Indice de Dépense Énergétique (IDE)</h4>
+                                <span className="value">{result.ide_calcul_kwh_m2} <small>kWh/m²/an</small></span>
+                            </div>
+                            <div className={`kpi-card ${result.ofen_target_status === 'Conforme' ? 'success' : 'danger'}`}>
+                                <h4>Cible OFEN (160 - 240)</h4>
+                                <span className="value">{result.ofen_target_status}</span>
+                            </div>
+                        </div>
+
+                        {/* Validation du cadre légal (MoPEC / LVLEne) */}
+                        <div className={`mopec-alerts ${result.mopec_compliance?.is_compliant ? 'compliant' : 'non-compliant'}`}>
+                            <h4>Statut Légal (MoPEC)</h4>
+                            {result.mopec_compliance?.is_compliant ? (
+                                <p style={{ color: 'green' }}>✅ L'infrastructure respecte les exigences de base du MoPEC.</p>
+                            ) : (
+                                <ul style={{ color: '#d35400' }}>
+                                    {result.mopec_compliance?.warnings.map((warning, index) => (
+                                        <li key={index}>⚠️ {warning}</li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+
+                        {/* Diagramme Thermodynamique */}
+                        <div className="sankey-container" style={{ marginTop: '2rem', padding: '1rem', backgroundColor: '#f9f9f9', borderRadius: '8px' }}>
+                            <h4>Répartition Thermodynamique Estimée (Norme SIA 385/9)</h4>
+                            <p style={{ fontSize: '0.85rem', color: '#666' }}>
+                                Visualisation des vecteurs de déperdition thermique basée sur les modèles physiques HEIG-VD.
+                            </p>
+                            <Chart
+                                chartType="Sankey"
+                                width="100%"
+                                height="280px"
+                                data={generateSankeyData()}
+                                options={{
+                                    sankey: {
+                                        node: { width: 20, colors: ['#2c3e50', '#e74c3c', '#3498db', '#f39c12', '#9b59b6'] },
+                                        link: { colorMode: 'gradient' }
+                                    }
+                                }}
+                            />
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default DashboardBaseline;
+
+# ==================================================
+# FILE: frontend\src\views\RoadmapReport.jsx
+# ==================================================
+
+import React from 'react';
+
+const RoadmapReport = ({ simulationResults }) => {
+    if (!simulationResults || simulationResults.measures_evaluation.length === 0) {
+        return (
+            <div className="roadmap-report empty-state" style={{ padding: '2rem', textAlign: 'center' }}>
+                <h2>Feuille de Route non disponible</h2>
+                <p>Veuillez d'abord configurer une variante dans le <strong>Module 3</strong>.</p>
+            </div>
+        );
+    }
+
+    const totalCapex = simulationResults.measures_evaluation.reduce((acc, m) => acc + m.capex_chf, 0);
+    const totalSavingsYearly = simulationResults.measures_evaluation.reduce((acc, m) => acc + m.savings_chf_year, 0);
+    const globalTri = totalSavingsYearly > 0 ? (totalCapex / totalSavingsYearly).toFixed(1) : 'N/A';
+
+    // Estimation des tonnes de CO2 évitées (Facteur moyen gaz ~0.228 kg/kWh)
+    const tonnesCO2Evitees = (simulationResults.energy_saved_kwh * 0.228) / 1000;
+
+    return (
+        <div className="roadmap-report" style={{ padding: '2rem', backgroundColor: '#fff', color: '#333' }}>
+
+            <div className="report-header" style={{ borderBottom: '3px solid #e74c3c', paddingBottom: '1rem', marginBottom: '2rem' }}>
+                <h1 style={{ margin: 0, color: '#2c3e50' }}>Feuille de Route : Décarbonation & Efficacité</h1>
+                <h3 style={{ margin: '0.5rem 0', color: '#7f8c8d' }}>Méthodologie HEIG-VD / Norme SIA 385/9</h3>
+            </div>
+
+            {/* SYNTHÈSE ÉNERGÉTIQUE ET ÉCOLOGIQUE */}
+            <div className="report-section">
+                <h2 style={{ color: '#27ae60' }}>1. Bilan Énergétique et Écologique (ACV)</h2>
+                <p>L'application des leviers d'optimisation permet une restructuration majeure de l'empreinte environnementale de l'infrastructure.</p>
+
+                <div className="executive-summary" style={{ display: 'flex', gap: '2rem', marginBottom: '2rem', marginTop: '1rem' }}>
+                    <div className="summary-box" style={{ flex: 1, padding: '1rem', backgroundColor: '#e8f8f5', borderRadius: '8px', borderLeft: '4px solid #27ae60' }}>
+                        <h4>Énergie Sauvée</h4>
+                        <p style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#27ae60' }}>
+                            {simulationResults.energy_saved_kwh.toLocaleString('fr-CH')} <small>kWh/an</small>
+                        </p>
+                    </div>
+                    <div className="summary-box" style={{ flex: 1, padding: '1rem', backgroundColor: '#ebf5fb', borderRadius: '8px', borderLeft: '4px solid #2980b9' }}>
+                        <h4>Émissions Évitées</h4>
+                        <p style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#2980b9' }}>
+                            - {tonnesCO2Evitees.toFixed(1)} <small>t CO₂-eq/an</small>
+                        </p>
+                    </div>
+                    <div className="summary-box" style={{ flex: 1, padding: '1rem', backgroundColor: '#fef9e7', borderRadius: '8px', borderLeft: '4px solid #f39c12' }}>
+                        <h4>Conformité Légale (MoPEC)</h4>
+                        <p style={{ fontSize: '1.2rem', fontWeight: 'bold', color: simulationResults.mopec_compliant ? '#27ae60' : '#e74c3c' }}>
+                            {simulationResults.mopec_compliant ? '✅ Validée' : '❌ Non Atteinte'}
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            {/* SYNTHÈSE FINANCIÈRE */}
+            <div className="report-section">
+                <h2 style={{ color: '#2980b9' }}>2. Bilan Économique (CAPEX / OPEX)</h2>
+                <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1rem', textAlign: 'left' }}>
+                    <thead>
+                        <tr style={{ backgroundColor: '#f2f2f2' }}>
+                            <th style={{ padding: '10px', borderBottom: '2px solid #ddd' }}>Indicateur Financier</th>
+                            <th style={{ padding: '10px', borderBottom: '2px solid #ddd' }}>Valeur Estimée</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td style={{ padding: '10px', borderBottom: '1px solid #ddd' }}>Investissement Total Requis (CAPEX)</td>
+                            <td style={{ padding: '10px', borderBottom: '1px solid #ddd', fontWeight: 'bold' }}>{totalCapex.toLocaleString('fr-CH')} CHF</td>
+                        </tr>
+                        <tr>
+                            <td style={{ padding: '10px', borderBottom: '1px solid #ddd' }}>Réduction de la Facture Énergétique (OPEX)</td>
+                            <td style={{ padding: '10px', borderBottom: '1px solid #ddd', color: '#27ae60', fontWeight: 'bold' }}>+ {totalSavingsYearly.toLocaleString('fr-CH')} CHF/an</td>
+                        </tr>
+                        <tr>
+                            <td style={{ padding: '10px', borderBottom: '1px solid #ddd' }}>Temps de Retour sur Investissement (TRI)</td>
+                            <td style={{ padding: '10px', borderBottom: '1px solid #ddd', fontWeight: 'bold' }}>{globalTri} ans</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            {/* PHASAGE DÉTAILLÉ */}
+            <div className="report-section" style={{ marginTop: '2rem' }}>
+                <h2 style={{ color: '#2c3e50' }}>3. Plan d'Action Recommandé (Détail des Mesures)</h2>
+                <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1rem' }}>
+                    <thead>
+                        <tr style={{ backgroundColor: '#34495e', color: 'white', textAlign: 'left' }}>
+                            <th style={{ padding: '10px' }}>Catégorie</th>
+                            <th style={{ padding: '10px' }}>Mesure Technique</th>
+                            <th style={{ padding: '10px' }}>Budget</th>
+                            <th style={{ padding: '10px' }}>TRC (Carbone)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {simulationResults.measures_evaluation.map((m, idx) => (
+                            <tr key={idx} style={{ borderBottom: '1px solid #ddd' }}>
+                                <td style={{ padding: '10px' }}><strong>{m.category}</strong></td>
+                                <td style={{ padding: '10px' }}>{m.name}</td>
+                                <td style={{ padding: '10px' }}>{m.capex_chf.toLocaleString('fr-CH')} CHF</td>
+                                <td style={{ padding: '10px', color: m.trc_years < 3 ? 'green' : 'orange' }}>
+                                    {m.trc_years === 0 ? 'Immédiat' : `${m.trc_years} ans`}
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+                <p style={{ fontSize: '0.85rem', color: '#7f8c8d', marginTop: '10px' }}>
+                    *TRC : Le Temps de Retour Carbone indique la durée nécessaire pour que les émissions de CO₂ évitées en exploitation compensent l'énergie grise (fabrication/pose) du matériel, selon les standards KBOB.
+                </p>
+            </div>
+
+            <div className="report-footer no-print" style={{ marginTop: '3rem', textAlign: 'center' }}>
+                <button onClick={() => window.print()} style={{ padding: '10px 20px', backgroundColor: '#e74c3c', color: 'white', border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold' }}>
+                    🖨️ Exporter la Feuille de Route (PDF)
+                </button>
+            </div>
+        </div>
+    );
+};
+
+export default RoadmapReport;
+
+# ==================================================
+# FILE: frontend\src\views\SimulationEngine.jsx
+# ==================================================
+
+import React, { useState } from 'react';
+import { runSimulation } from '../services/api';
+
+const SimulationEngine = () => {
+    const [inputs, setInputs] = useState({
+        area_m2: 1000,
+        t_water: 26.0,
+        t_air: 12.0,
+        rh_air: 65.0,
+        wind_speed: 3.0,
+        current_energy: 'gaz',
+        apply_cover: false,
+        apply_isolation: false,
+        apply_mcr_night_setback: false,
+        apply_vfd_pumps: false,
+        heating_system: 'aucun',
+        apply_cta_recovery: false
+    });
+
+    const [results, setResults] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    const handleSimulate = async () => {
+        setLoading(true);
+        try {
+            const data = await runSimulation(inputs);
+            setResults(data);
+        } catch (error) {
+            console.error("Erreur API :", error);
+        }
+        setLoading(false);
+    };
+
+    return (
+        <div className="simulation-engine">
+            <div className="module-header">
+                <h2>Module 3 : Moteur de Variantes Multicritère</h2>
+                <p>Combinez les leviers Passifs, Opérationnels et Actifs pour piloter la stratégie d'assainissement communal.</p>
+            </div>
+
+            <div className="layout-grid">
+                {/* 🎛️ PANNEAU DE CONTRÔLE DES 3 FAMILLES DE LEVIERS */}
+                <div className="control-panel card">
+                    <h3>Matrice des Leviers d'Action</h3>
+
+                    {/* 1. PASSIFS */}
+                    <div className="variant-section" style={{marginBottom: '1rem'}}>
+                        <h4 style={{color: '#2980b9'}}>1. Leviers Passifs (Structure & Enveloppe)</h4>
+                        <label className="toggle" style={{display: 'block', margin: '5px 0'}}>
+                            <input type="checkbox" checked={inputs.apply_cover} onChange={e => setInputs({...inputs, apply_cover: e.target.checked})} />
+                            Couverture thermique nocturne (Bâche)
+                        </label>
+                        <label className="toggle" style={{display: 'block', margin: '5px 0'}}>
+                            <input type="checkbox" checked={inputs.apply_isolation} onChange={e => setInputs({...inputs, apply_isolation: e.target.checked})} />
+                            Isolation des cuves / bassins
+                        </label>
+                    </div>
+
+                    {/* 2. OPERATIONNELS */}
+                    <div className="variant-section" style={{marginBottom: '1rem'}}>
+                        <h4 style={{color: '#27ae60'}}>2. Leviers Opérationnels (MCR & Régulation)</h4>
+                        <label className="toggle" style={{display: 'block', margin: '5px 0'}}>
+                            <input type="checkbox" checked={inputs.apply_mcr_night_setback} onChange={e => setInputs({...inputs, apply_mcr_night_setback: e.target.checked})} />
+                            Abaissement nocturne de l'eau (-1°C)
+                        </label>
+                        <label className="toggle" style={{display: 'block', margin: '5px 0'}}>
+                            <input type="checkbox" checked={inputs.apply_vfd_pumps} onChange={e => setInputs({...inputs, apply_vfd_pumps: e.target.checked})} />
+                            Variateurs de fréquence sur pompes (VFD)
+                        </label>
+                    </div>
+
+                    {/* 3. ACTIFS */}
+                    <div className="variant-section" style={{marginBottom: '1rem'}}>
+                        <h4 style={{color: '#e74c3c'}}>3. Leviers Actifs (Systèmes & Énergies)</h4>
+                        <div style={{margin: '5px 0'}}>
+                            <label>Substitution de chauffage :</label>
+                            <select value={inputs.heating_system} onChange={e => setInputs({...inputs, heating_system: e.target.value})} style={{width: '100%', marginTop: '5px'}}>
+                                <option value="aucun">Conserver le vecteur actuel (Gaz/Mazout)</option>
+                                <option value="cad">Raccordement Chauffage à Distance (CAD)</option>
+                                <option value="pac">Pompe à Chaleur (PAC) géothermique</option>
+                            </select>
+                        </div>
+                        <label className="toggle" style={{display: 'block', margin: '10px 0 5px 0'}}>
+                            <input type="checkbox" checked={inputs.apply_cta_recovery} onChange={e => setInputs({...inputs, apply_cta_recovery: e.target.checked})} />
+                            Récupération de chaleur CTA (Double flux)
+                        </label>
+                    </div>
+
+                    <button className="btn-primary" onClick={handleSimulate} disabled={loading} style={{marginTop: '1.5rem', width: '100%'}}>
+                        {loading ? 'Calculs multicritères en cours...' : 'Lancer la Simulation Croisée'}
+                    </button>
+                </div>
+
+                {/* 📊 PANNEAU DE RÉSULTATS */}
+                {results && (
+                    <div className="results-panel card">
+                        <h3>Bilan de la Stratégie de Rénovation</h3>
+
+                        <div className="kpi-grid">
+                            <div className="kpi-card">
+                                <h4>Énergie Totale Sauvée</h4>
+                                <span className="value text-success">-{results.energy_saved_kwh.toLocaleString('fr-CH')} kWh/an</span>
+                            </div>
+                            <div className={`kpi-card ${results.mopec_compliant ? 'success' : 'danger'}`}>
+                                <h4>Validation MoPEC</h4>
+                                <span className="value">{results.mopec_compliant ? '✅ Conforme' : '❌ Non-Conforme'}</span>
+                            </div>
+                        </div>
+
+                        <h4>Analyse Détaillée par Mesure (CAPEX / OPEX / ACV)</h4>
+                        {results.measures_evaluation.length === 0 ? (
+                            <p style={{color: '#7f8c8d', fontStyle: 'italic'}}>Aucun levier activé.</p>
+                        ) : (
+                            <table className="analysis-table">
+                                <thead>
+                                    <tr>
+                                        <th>Catégorie</th>
+                                        <th>Mesure</th>
+                                        <th>Investissement (CAPEX)</th>
+                                        <th>Économie (OPEX)</th>
+                                        <th>TRI</th>
+                                        <th>TRC (Carbone)</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {results.measures_evaluation.map((m, idx) => (
+                                        <tr key={idx}>
+                                            <td><span className={`badge ${m.category.toLowerCase()}`}>{m.category}</span></td>
+                                            <td><strong>{m.name}</strong></td>
+                                            <td>{m.capex_chf.toLocaleString('fr-CH')} CHF</td>
+                                            <td className="text-success">+{m.savings_chf_year.toLocaleString('fr-CH')} CHF/an</td>
+                                            <td><strong>{m.tri_years} ans</strong></td>
+                                            <td>{m.trc_years} ans</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        )}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default SimulationEngine;
+
+# ==================================================
+# FILE: scripts_processing\parse_idaice_outputs.py
+# ==================================================
+
+# ==================================================
+# FILE: scripts_processing\parse_idaice_outputs.py
+# ==================================================
+
+import pandas as pd
+import argparse
+from pathlib import Path
+
+
+def process_idaice_prn(input_file: str, output_file: str):
+    """
+    Parse les fichiers de résultats bruts .prn d'IDA-ICE, moyenne les données
+    horaires, et exporte une matrice .csv allégée pour l'API.
+    """
+    print(f"Parsing IDA-ICE output: {input_file}")
+    try:
+        # Les fichiers PRN d'IDA-ICE utilisent souvent des tabulations ou des espaces multiples
+        df = pd.read_csv(input_file, delim_whitespace=True, skiprows=2)
+
+        # Nettoyage et renommage standardisé
+        if 'T_air' in df.columns and 'Q_heat' in df.columns:
+            # Ré-échantillonnage horaire (hypothèse: les index sont des heures décimales)
+            df['hour_int'] = df.index.astype(int)
+            matrix = df.groupby('hour_int').mean()
+
+            matrix.to_csv(output_file, index=False)
+            print(f"Matrice exportée avec succès vers: {output_file}")
+        else:
+            print("Colonnes attendues introuvables. Vérifiez le format IDA-ICE.")
+
+    except Exception as e:
+        print(f"Erreur de traitement: {e}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Traitement des outputs IDA-ICE")
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--output", type=str, required=True)
+    args = parser.parse_args()
+    process_idaice_prn(args.input, args.output)
+
+# ==================================================
+# FILE: scripts_processing\validate_matrices.py
+# ==================================================
+
+# ==================================================
+# FILE: scripts_processing\validate_matrices.py
+# ==================================================
+
+import pandas as pd
+import sys
+
+
+def validate_matrix_physics(csv_file: str):
+    """
+    Script CI/CD pour vérifier que les matrices générées respectent
+    les bornes de la physique du bâtiment (pas de puissance négative sans gain solaire, etc.)
+    """
+    print(f"Validation de la matrice {csv_file}...")
+    df = pd.read_csv(csv_file)
+
+    errors = 0
+    if 'Q_evap_kW' in df.columns:
+        if (df['Q_evap_kW'] < 0).any():
+            print("❌ ERREUR: Pertes par évaporation négatives détectées.")
+            errors += 1
+
+    if 'RH_air' in df.columns:
+        if (df['RH_air'] < 0).any() or (df['RH_air'] > 100).any():
+            print("❌ ERREUR: Humidité relative hors limites (0-100%).")
+            errors += 1
+
+    if errors == 0:
+        print("✅ Matrice physiquement cohérente.")
+        sys.exit(0)
+    else:
+        print(f"Échec de la validation avec {errors} erreurs.")
+        sys.exit(1)
+
+# ==================================================
+# FILE: tests\test_engine_physics.py
+# ==================================================
+
+# ==================================================
+# FILE: tests\test_engine_physics.py
+# ==================================================
+
+import pytest
+from backend.engine.physics_models.evaporation_model import calculate_evaporation_loss
+from backend.engine.physics_models.ventilation_model import calculate_cta_power_savings
+
+def test_evaporation_loss_positive():
+    """L'évaporation doit causer une perte thermique positive"""
+    loss = calculate_evaporation_loss(T_water=26, T_air=15, RH_air=60, wind_speed=2, pool_area=1000)
+    assert loss > 0
+
+def test_evaporation_cover_impact():
+    """La présence d'une bâche doit réduire drastiquement l'évaporation"""
+    loss_uncovered = calculate_evaporation_loss(26, 15, 60, 2, 1000, is_covered=False)
+    loss_covered = calculate_evaporation_loss(26, 15, 60, 2, 1000, is_covered=True)
+    assert loss_covered < loss_uncovered
+    assert loss_covered == pytest.approx(loss_uncovered * 0.05, rel=1e-3)
+
+def test_ventilation_affinity_laws():
+    """Réduire le débit de 50% doit réduire la puissance de 87.5%"""
+    savings = calculate_cta_power_savings(10000, reduction_factor=0.5)
+    assert savings == pytest.approx(0.875, rel=1e-3)
+
+# ==================================================
+# FILE: tests\test_lca_values.py
+# ==================================================
+
+# ==================================================
+# FILE: tests\test_lca_values.py
+# ==================================================
+
+from backend.engine.lca_calculator import calculate_carbon_roi, KBOB_DB
+
+
+def test_carbon_roi_calculation():
+    """Test du calcul du Temps de Retour Carbone (TRC)"""
+    # Dette: 1000 m2 de bâche * 2.1 kgCO2 = 2100 kgCO2
+    # Gain: 50,000 kWh/an sauvés * 0.029 kgCO2 = 1450 kgCO2/an
+    # ROI: 2100 / 1450 = ~1.44 années
+
+    roi = calculate_carbon_roi(energy_saved_kwh_per_year=50000, material_type="bache_thermique", material_quantity=1000)
+    expected_roi = (1000 * KBOB_DB["bache_thermique"]) / (50000 * KBOB_DB["mix_electrique_ch"])
+    assert roi == expected_roi
+
+
+def test_carbon_roi_no_savings():
+    """Si aucune économie n'est réalisée, le ROI doit être infini"""
+    roi = calculate_carbon_roi(0, "bache_thermique", 1000)
+    assert roi == float('inf')

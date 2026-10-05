@@ -1,0 +1,12 @@
+# Environnements virtuels
+venv/
+.venv/
+__pycache__/
+
+# Frontend compilé et modules
+frontend/node_modules/
+frontend/build/
+
+# Fichiers IDE
+.idea/
+.vscode/
